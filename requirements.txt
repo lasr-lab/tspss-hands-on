@@ -1,0 +1,3 @@
+numpy
+opencv-python   # live video windows and .mp4 recording
+sounddevice     # live audio playback (needs system PortAudio: apt install libportaudio2)
