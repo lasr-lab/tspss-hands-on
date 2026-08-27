@@ -434,16 +434,29 @@ class UDPDecoder:
         # A generous receive buffer: the sender bursts chunked JPEG frames.
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, args.rcvbuf)
 
-        self.multicast_group = args.bind if is_multicast(args.bind) else None
+        # The group to join and the local address to bind are independent:
+        # --bind <group> is a shorthand, --multicast-group works with any bind
+        # address (and is the only form Windows accepts, since it refuses to
+        # bind a socket to a multicast address).
+        self.multicast_group = args.multicast_group or (
+            args.bind if is_multicast(args.bind) else None
+        )
+        bind_addr = args.bind
         try:
-            self.sock.bind((args.bind, args.port))
+            self.sock.bind((bind_addr, args.port))
         except OSError as exc:
-            raise SystemExit(
-                f"[udp] cannot bind {args.bind}:{args.port} - {exc}\n"
-                f"      --bind must be an address of this machine, or a "
-                f"multicast group the sender streams to "
-                f"(use --bind 0.0.0.0 to listen on every interface)."
-            ) from exc
+            if self.multicast_group and is_multicast(bind_addr):
+                print(f"[udp] cannot bind the group address directly ({exc}), "
+                      f"binding 0.0.0.0 instead", file=sys.stderr)
+                bind_addr = "0.0.0.0"
+                self.sock.bind((bind_addr, args.port))
+            else:
+                raise SystemExit(
+                    f"[udp] cannot bind {bind_addr}:{args.port} - {exc}\n"
+                    f"      --bind takes an address of THIS machine (not the "
+                    f"sender's) - use --bind 0.0.0.0 to listen on every "
+                    f"interface, and --multicast-group <addr> to join a group."
+                ) from exc
 
         if self.multicast_group:
             # Joining tells the switch/AP to forward the group to this host; the
@@ -633,6 +646,8 @@ def parse_args(argv=None):
     parser.add_argument("--bind", default=DEFAULT_BIND,
                         help="local interface to listen on (0.0.0.0 for all), or a "
                              "multicast group in 224.0.0.0/4 to join")
+    parser.add_argument("--multicast-group", default=None,
+                        help="multicast group to join, independent of --bind")
     parser.add_argument("--iface", default="0.0.0.0",
                         help="local IP of the interface to join the multicast group on")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
