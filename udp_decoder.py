@@ -57,8 +57,12 @@ except Exception:  # pragma: no cover - import can fail on missing PortAudio
 
 
 # Matches the sender's defaults (target_ip / target_port in udp_sender.py).
-DEFAULT_BIND = "192.168.1.29"
-DEFAULT_PORT = 8080
+# Defaults that work on any machine without arguments: listen on every
+# interface and join the group the sender streams to (see target_ip /
+# target_port in udp_sender.py). Pass --multicast-group "" to skip the join.
+DEFAULT_BIND = "0.0.0.0"
+DEFAULT_PORT = 8081
+DEFAULT_MULTICAST_GROUP = "239.255.42.1"
 
 SENSOR_TYPES = ("pressure", "pressure_ap", "imu_raw", "imu_euler", "imu_quat", "gas")
 IMU_SENSOR_NAMES = {1: "ACC", 2: "GYRO", 3: "MAG", 6: "LINACC"}
@@ -464,13 +468,21 @@ class UDPDecoder:
             mreq = socket.inet_aton(self.multicast_group) + socket.inet_aton(args.iface)
             try:
                 self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                print(f"[udp] joined multicast group {self.multicast_group}"
+                      + (f" on {args.iface}" if args.iface != "0.0.0.0" else ""))
             except OSError as exc:
-                raise SystemExit(
-                    f"[udp] cannot join multicast group {self.multicast_group} - {exc}\n"
-                    f"      pass --iface <local ip of the interface facing the sender>."
-                ) from exc
-            print(f"[udp] joined multicast group {self.multicast_group}"
-                  + (f" on {args.iface}" if args.iface != "0.0.0.0" else ""))
+                # Only fatal when the group was asked for: the default join must
+                # not stop a plain unicast run on a host without a multicast
+                # route.
+                if args.multicast_group != DEFAULT_MULTICAST_GROUP:
+                    raise SystemExit(
+                        f"[udp] cannot join multicast group {self.multicast_group} - {exc}\n"
+                        f"      pass --iface <local ip of the interface facing the sender>."
+                    ) from exc
+                print(f"[udp] could not join the default group "
+                      f"{self.multicast_group} ({exc}) - unicast still works",
+                      file=sys.stderr)
+                self.multicast_group = None
 
         self.sock.settimeout(0.5)
 
@@ -494,7 +506,17 @@ class UDPDecoder:
     # -- network thread ---------------------------------------------------
 
     def _receive_loop(self):
+        next_gc = time.monotonic() + self.reassembler.timeout
         while not self._stop.is_set():
+            # Collect on a timer, not only when the socket goes idle: on a busy
+            # stream recvfrom never times out, so incomplete messages would pile
+            # up forever and `incomplete=` would keep reading 0 while every
+            # image silently failed to reassemble.
+            now = time.monotonic()
+            if now >= next_gc:
+                self.reassembler.collect_garbage()
+                next_gc = now + self.reassembler.timeout
+
             try:
                 packet, _addr = self.sock.recvfrom(65535)
             except socket.timeout:
@@ -646,8 +668,9 @@ def parse_args(argv=None):
     parser.add_argument("--bind", default=DEFAULT_BIND,
                         help="local interface to listen on (0.0.0.0 for all), or a "
                              "multicast group in 224.0.0.0/4 to join")
-    parser.add_argument("--multicast-group", default=None,
-                        help="multicast group to join, independent of --bind")
+    parser.add_argument("--multicast-group", default=DEFAULT_MULTICAST_GROUP,
+                        help="multicast group to join, independent of --bind; "
+                             "pass an empty string to receive unicast only")
     parser.add_argument("--iface", default="0.0.0.0",
                         help="local IP of the interface to join the multicast group on")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
