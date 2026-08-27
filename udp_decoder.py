@@ -17,6 +17,14 @@ Wire format (see udp_sender.py):
   {"type": "<stream>", "data": {...}}                         plain message
   {"type": "chunk", "msg_type": ..., "message_id": ...,       fragment of a
    "chunk_index": i, "total_chunks": n, "data": "<b64>"}      large message
+  b"D360" + 30-byte header + raw JPEG bytes                   image chunk
+
+Images use the binary form: base64 inside JSON costs 33% on every image byte,
+and images are the bulk of the traffic. One extra packet per frame carries the
+XOR of all its chunks, so a single lost chunk is reconstructed rather than
+costing the whole frame - at 2% packet loss that is the difference between 72%
+and 94% of frames arriving. A sender running with binary_images:=false falls
+back to the JSON path above, which this decoder still understands.
 
 Usage:
   ./udp_decoder.py --port 8081
@@ -37,6 +45,7 @@ import json
 import os
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
@@ -66,6 +75,84 @@ DEFAULT_MULTICAST_GROUP = "239.255.42.1"
 
 SENSOR_TYPES = ("pressure", "pressure_ap", "imu_raw", "imu_euler", "imu_quat", "gas")
 IMU_SENSOR_NAMES = {1: "ACC", 2: "GYRO", 3: "MAG", 6: "LINACC"}
+
+
+# Binary image transport (see udp_sender.py). Images skip JSON/base64 entirely:
+# a fixed 30-byte header plus raw JPEG bytes, and one optional XOR parity packet
+# per frame that lets a single lost chunk be reconstructed.
+IMAGE_MAGIC = b"D360"
+IMAGE_HEADER = struct.Struct("<4sBBBBIHHHIII")
+FLAG_PARITY = 0x01
+
+
+class BinaryImageReassembler:
+    """Rebuilds JPEG frames from binary chunks, repairing one loss per frame."""
+
+    def __init__(self, timeout=2.0):
+        self.timeout = timeout
+        self._pending = {}
+        self.completed = 0
+        self.expired = 0
+        self.repaired = 0
+
+    def add(self, packet: bytes):
+        if len(packet) < IMAGE_HEADER.size:
+            return None
+        (magic, version, _type, index, flags, message_id, chunk_index,
+         total, chunk_size, total_bytes, _sec, _nsec) = IMAGE_HEADER.unpack_from(packet)
+        if magic != IMAGE_MAGIC or version != 1:
+            return None
+        payload = packet[IMAGE_HEADER.size:]
+
+        entry = self._pending.get(message_id)
+        if entry is None or entry["total"] != total:
+            entry = {"total": total, "size": chunk_size, "bytes": total_bytes,
+                     "index": index, "parts": {}, "parity": None, "t": time.monotonic()}
+            self._pending[message_id] = entry
+
+        if flags & FLAG_PARITY:
+            entry["parity"] = payload
+        else:
+            entry["parts"][chunk_index] = payload
+
+        frame = self._try_complete(entry)
+        if frame is None:
+            return None
+        del self._pending[message_id]
+        self.completed += 1
+        return entry["index"], frame
+
+    def _chunk_len(self, entry, i):
+        """Chunks are full-size except the last one."""
+        return min(entry["size"], entry["bytes"] - i * entry["size"])
+
+    def _try_complete(self, entry):
+        total, parts = entry["total"], entry["parts"]
+        missing = [i for i in range(total) if i not in parts]
+
+        if len(missing) == 1 and entry["parity"] is not None:
+            # XOR everything that did arrive back out of the parity packet and
+            # what remains is exactly the chunk that did not.
+            size = entry["size"]
+            recovered = int.from_bytes(entry["parity"], "big")
+            for i, part in parts.items():
+                recovered ^= int.from_bytes(part.ljust(size, b"\x00"), "big")
+            lost = missing[0]
+            parts[lost] = recovered.to_bytes(size, "big")[:self._chunk_len(entry, lost)]
+            self.repaired += 1
+            missing = []
+
+        if missing:
+            return None
+        frame = b"".join(parts[i] for i in range(total))
+        return frame if len(frame) == entry["bytes"] else None
+
+    def collect_garbage(self):
+        deadline = time.monotonic() - self.timeout
+        stale = [mid for mid, e in self._pending.items() if e["t"] < deadline]
+        for mid in stale:
+            del self._pending[mid]
+        self.expired += len(stale)
 
 
 def is_multicast(ip: str) -> bool:
@@ -156,6 +243,11 @@ class VideoSink:
             jpeg = base64.b64decode(data["data"])
         except (binascii.Error, ValueError, KeyError):
             return
+        self.submit_jpeg(index, jpeg, data)
+
+    def submit_jpeg(self, index: int, jpeg: bytes, data=None):
+        """Binary transport hands the JPEG straight over, already decoded."""
+        data = data if data is not None else {"format": "jpeg", "index": index}
         self.received[index] += 1
         if self.save_frames:
             # The payload is already JPEG, so this path needs no decoder at all
@@ -487,6 +579,7 @@ class UDPDecoder:
         self.sock.settimeout(0.5)
 
         self.reassembler = ChunkReassembler(timeout=args.chunk_timeout)
+        self.images = BinaryImageReassembler(timeout=args.chunk_timeout)
         self.rates = RateCounter()
         self.video = VideoSink(
             args.out_dir, record=args.record_video, save_frames=args.save_frames,
@@ -515,15 +608,28 @@ class UDPDecoder:
             now = time.monotonic()
             if now >= next_gc:
                 self.reassembler.collect_garbage()
+                self.images.collect_garbage()
                 next_gc = now + self.reassembler.timeout
 
             try:
                 packet, _addr = self.sock.recvfrom(65535)
             except socket.timeout:
                 self.reassembler.collect_garbage()
+                self.images.collect_garbage()
                 continue
             except OSError:
                 break
+
+            # Images arrive as binary; everything else is JSON. The magic bytes
+            # cannot collide with JSON, which always starts with '{'.
+            if packet[:4] == IMAGE_MAGIC:
+                self.rates.add("chunk", len(packet))
+                frame = self.images.add(packet)
+                if frame is not None:
+                    index, jpeg = frame
+                    self.rates.add_reassembled("color_image")
+                    self.video.submit_jpeg(index, jpeg)
+                continue
 
             try:
                 message = json.loads(packet.decode("utf-8"))
@@ -629,8 +735,11 @@ class UDPDecoder:
 
     def _print_status(self):
         line = f"[stats] {self.rates.report_and_reset()}"
-        if self.reassembler.expired or self.malformed:
-            line += f" | incomplete={self.reassembler.expired} malformed={self.malformed}"
+        incomplete = self.reassembler.expired + self.images.expired
+        if incomplete or self.malformed:
+            line += f" | incomplete={incomplete} malformed={self.malformed}"
+        if self.images.repaired:
+            line += f" | fec_repaired={self.images.repaired}"
         if self.audio.underruns:
             line += f" | audio_underruns={self.audio.underruns}"
         frames = sum(self.video.received.values())

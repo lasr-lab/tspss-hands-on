@@ -99,6 +99,33 @@ Multicast is a poor fit for busy WiFi: access points send it at the lowest basic
 rate with no link-layer retries, and many block it between clients entirely.
 Expect more dropped frames than with unicast, and see below if nothing arrives.
 
+## Dropped frames
+
+Images are chunked into ~1400-byte packets and every chunk must arrive, so on a
+lossy link the frame rate collapses long before the link is saturated. Two
+things in the protocol deal with that, both automatic:
+
+- images travel as raw binary (`b"D360"` + 30-byte header + JPEG) instead of
+  base64 inside JSON, which is a quarter fewer bytes;
+- each frame carries one XOR parity packet, so any single lost chunk is
+  reconstructed instead of costing the frame. Measured delivery at 2% packet
+  loss: 72% without, 94% with.
+
+The stats line reports repairs as they happen:
+
+```
+[stats] ... | incomplete=3 malformed=0 | fec_repaired=112 | frames=940
+```
+
+`fec_repaired` climbing means the link is lossy and the parity is earning its
+keep. `incomplete` climbing means frames are losing *more than one* chunk —
+reduce the bandwidth (`max_image_size`, `image_max_hz`) rather than expecting
+FEC to cover it.
+
+**This decoder must match the sender.** An older decoder cannot read the binary
+images and will count them as `malformed` while `frames=0`; start the sender
+with `-p binary_images:=false` if some machine cannot be updated.
+
 ## Nothing arrives at all
 
 Beyond `frames=0`, when no stream shows up in the stats line:
